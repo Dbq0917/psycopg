@@ -64,6 +64,10 @@ class ServerCursorMixin(BaseCursor[ConnectionType, Row]):
         parts.insert(1, f"{self._name!r}")
         return " ".join(parts)
 
+    def _close(self) -> None:
+        self._conn._unregister_server_cursor(self)
+        super()._close()
+
     @property
     def name(self) -> str:
         """The name of the cursor."""
@@ -135,6 +139,7 @@ class ServerCursorMixin(BaseCursor[ConnectionType, Row]):
         self._results = results
         self._select_current_result(0, format=self._format)
         self._described = True
+        self._conn._register_server_cursor(self)
 
     def _close_gen(self) -> PQGen[None]:
         ts = self._conn.pgconn.transaction_status

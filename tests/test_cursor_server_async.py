@@ -546,6 +546,54 @@ async def test_hold(aconn):
         assert await curs.fetchone() == (1,)
 
 
+@pytest.mark.crdb_skip("cursor with hold")
+async def test_transaction_end_cleans_abandoned_cursor(aconn, recwarn, acommands):
+    recwarn.clear()
+    async with aconn.transaction():
+        cur = aconn.cursor("foo", withhold=True)
+        await cur.execute("select generate_series(0, 2)")
+        assert await cur.fetchone() == (0,)
+        del cur
+
+    assert recwarn.pop(ResourceWarning)
+
+    acommands.popall()
+    async with aconn.cursor("foo", withhold=True) as cur:
+        await cur.execute("select generate_series(0, 2)")
+        assert await cur.fetchone() == (0,)
+
+    # The declaration path should not check for existing cursors.
+    assert not any("pg_cursors" in cmd for cmd in acommands.popall())
+
+
+async def test_transaction_end_keeps_cursor_in_use(aconn):
+    async with aconn.transaction():
+        async with aconn.transaction():
+            cur = aconn.cursor("foo")
+            await cur.execute("select generate_series(0, 2)")
+            assert await cur.fetchone() == (0,)
+
+        assert await cur.fetchone() == (1,)
+        await cur.close()
+
+
+@pytest.mark.crdb_skip("cursor with hold")
+async def test_reuse_connection_after_cursor_cleanup(aconn, recwarn):
+    recwarn.clear()
+    async with aconn.transaction():
+        cur = aconn.cursor("foo", withhold=True)
+        await cur.execute("select generate_series(0, 2)")
+        assert await cur.fetchone() == (0,)
+
+    del cur
+    assert recwarn.pop(ResourceWarning)
+
+    cur = aconn.cursor("foo", withhold=True)
+    await cur.execute("select generate_series(0, 2)")
+    assert await cur.fetchone() == (0,)
+    await cur.close()
+
+
 @pytest.mark.parametrize("row_factory", ["tuple_row", "namedtuple_row"])
 async def test_steal_cursor(aconn, row_factory):
     cur1 = aconn.cursor()

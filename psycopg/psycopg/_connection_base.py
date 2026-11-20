@@ -18,7 +18,7 @@ from collections.abc import Callable
 from . import errors as e
 from . import generators, postgres, pq
 from .abc import PQGen, PQGenConn, QueryNoTemplate
-from .sql import SQL, Composable
+from .sql import SQL, Literal, Composable, Identifier
 from ._tpc import Xid
 from .rows import Row
 from .adapt import AdaptersMap
@@ -108,6 +108,10 @@ class BaseConnection(Generic[Row]):
 
         # Number of transaction blocks currently entered
         self._num_transactions = 0
+
+        # Server-side cursors currently open on the connection, by name.
+        # Weak references allow cleanup of cursors abandoned by the user.
+        self._server_cursors: dict[str, ReferenceType[Any]] = {}
 
         self._closed = False  # closed by an explicit close()
         self._prepared: PrepareManager = PrepareManager()
@@ -488,6 +492,55 @@ class BaseConnection(Generic[Row]):
                 )
         return result
 
+    def _register_server_cursor(self, cursor: Any) -> None:
+        """Keep track of a server-side cursor declared on this connection."""
+        self._server_cursors[cursor.name] = ref(cursor)
+
+    def _unregister_server_cursor(self, cursor: Any) -> None:
+        """Forget a server-side cursor closed explicitly."""
+        wcur = self._server_cursors.get(cursor.name)
+        if wcur is not None and wcur() is cursor:
+            del self._server_cursors[cursor.name]
+
+    def _cleanup_server_cursors_gen(self) -> PQGen[None]:
+        """Close server-side cursors abandoned by the application.
+
+        Cursors are owned by the connection, but they may outlive the Python
+        object that declared them (for instance a WITHOUT HOLD cursor declared
+        in a nested transaction). If the application still holds the cursor,
+        leave it alone: it may still be in use.
+        """
+        if (
+            self._pipeline
+            or not self._server_cursors
+            or self.pgconn.status != OK
+            or self.pgconn.transaction_status not in (IDLE, INTRANS)
+        ):
+            return
+
+        names: list[str] = []
+        for name, wcur in list(self._server_cursors.items()):
+            if (cur := wcur()) is None or cur.closed:
+                del self._server_cursors[name]
+                names.append(name)
+
+        if not names:
+            return
+
+        name_list = SQL(", ").join(Literal(name) for name in names)
+        query = SQL(
+            "SELECT name FROM pg_catalog.pg_cursors WHERE name IN ({})"
+        ).format(name_list)
+        res = yield from self._exec_command(query)
+        assert res is not None
+
+        encoding = self.pgconn._encoding
+        for i in range(res.ntuples):
+            value = res.get_value(i, 0)
+            assert value is not None
+            name = value.decode(encoding)
+            yield from self._exec_command(SQL("CLOSE {}").format(Identifier(name)))
+
     def _deallocate(self, name: bytes | None) -> PQGen[None]:
         """
         Deallocate one, or all, prepared statement in the session.
@@ -540,6 +593,8 @@ class BaseConnection(Generic[Row]):
 
     def _start_query(self) -> PQGen[None]:
         """Generator to start a transaction if necessary."""
+        yield from self._cleanup_server_cursors_gen()
+
         if self._autocommit:
             return
 
@@ -583,12 +638,15 @@ class BaseConnection(Generic[Row]):
                 "commit() cannot be used during a two-phase transaction"
             )
         if self.pgconn.transaction_status == IDLE:
+            yield from self._cleanup_server_cursors_gen()
             return
 
         yield from self._exec_command(b"COMMIT")
 
         if self._pipeline:
             yield from self._pipeline._sync_gen()
+
+        yield from self._cleanup_server_cursors_gen()
 
     def _rollback_gen(self) -> PQGen[None]:
         """Generator implementing `Connection.rollback()`."""
@@ -608,6 +666,7 @@ class BaseConnection(Generic[Row]):
             yield from self._pipeline._sync_gen()
 
         if self.pgconn.transaction_status == IDLE:
+            yield from self._cleanup_server_cursors_gen()
             return
 
         yield from self._exec_command(b"ROLLBACK")
@@ -616,6 +675,8 @@ class BaseConnection(Generic[Row]):
 
         if self._pipeline:
             yield from self._pipeline._sync_gen()
+
+        yield from self._cleanup_server_cursors_gen()
 
     def xid(self, format_id: int, gtrid: str, bqual: str) -> Xid:
         """

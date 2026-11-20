@@ -116,6 +116,7 @@ class BaseTransaction(Generic[ConnectionType]):
             raise TypeError("transaction blocks can be used only once")
 
     def _enter_gen(self) -> PQGen[None]:
+        yield from self._conn._cleanup_server_cursors_gen()
         self.status = self.Status.ACTIVE
 
         self._push_savepoint()
@@ -156,6 +157,8 @@ class BaseTransaction(Generic[ConnectionType]):
         for command in self._get_commit_commands():
             yield from self._conn._exec_command(command)
 
+        yield from self._conn._cleanup_server_cursors_gen()
+
     def _rollback_gen(self, exc_val: BaseException | None) -> PQGen[bool]:
         if isinstance(exc_val, Rollback):
             logger.debug(f"{self._conn}: Explicit rollback from: ", exc_info=True)
@@ -176,6 +179,8 @@ class BaseTransaction(Generic[ConnectionType]):
         # Also clear the prepared statements cache.
         self._conn._prepared.clear()
         yield from self._conn._prepared.maintain_gen(self._conn)
+
+        yield from self._conn._cleanup_server_cursors_gen()
 
         if isinstance(exc_val, Rollback):
             if not exc_val.transaction or exc_val.transaction is self:
