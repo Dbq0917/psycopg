@@ -120,8 +120,14 @@ context stared by `~ConnectionPool.connection()`):
 - if there is a transaction open, the transaction is committed (if the block
   is exited normally) or rolled back (if it is exited with an exception);
 
+- session-level settings are reset to the values they had when the connection
+  was added to the pool. Settings changed by the `!configure` callback are
+  restored too. This is performed in a single round-trip for the whole session,
+  rather than one round-trip per setting;
+
 - if a `!reset` callback was provided, the connection is passed to it, to
-  allow application-specific cleanup if needed;
+  allow application-specific cleanup if needed. The callback can override the
+  session settings after the pool has reset them;
 
 - if, along this process, the connection is found in broken state, or if it
   passed the `!max_lifetime` configured at pool creation, it is discarded and

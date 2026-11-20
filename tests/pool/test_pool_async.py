@@ -230,6 +230,54 @@ async def test_reset(dsn):
         assert resets == 2
 
 
+async def test_reset_session_state(dsn):
+    async with pool.AsyncConnectionPool(dsn, min_size=1, max_size=1) as p:
+        async with p.connection() as conn:
+            pid = conn.info.backend_pid
+            cur = await conn.execute("show statement_timeout")
+            initial_timeout = await cur.fetchone()
+            cur = await conn.execute("show timezone")
+            initial_timezone = await cur.fetchone()
+
+            await conn.execute("set statement_timeout to '2s'")
+            await conn.execute("set timezone to '+05:00'")
+            await conn.commit()
+
+        await p.wait()
+
+        async with p.connection() as conn:
+            assert conn.info.backend_pid == pid
+            cur = await conn.execute("show statement_timeout")
+            assert await cur.fetchone() == initial_timeout
+            cur = await conn.execute("show timezone")
+            assert await cur.fetchone() == initial_timezone
+
+
+async def test_reset_session_state_configure(dsn):
+    async def configure(conn):
+        await conn.execute("set statement_timeout to '3s'")
+        await conn.execute("set timezone to '+03:00'")
+        await conn.commit()
+
+    async with pool.AsyncConnectionPool(
+        dsn, min_size=1, max_size=1, configure=configure
+    ) as p:
+        async with p.connection() as conn:
+            pid = conn.info.backend_pid
+            await conn.execute("set statement_timeout to '2s'")
+            await conn.execute("set timezone to '+05:00'")
+            await conn.commit()
+
+        await p.wait()
+
+        async with p.connection() as conn:
+            assert conn.info.backend_pid == pid
+            cur = await conn.execute("show statement_timeout")
+            assert await cur.fetchone() == ("3s",)
+            cur = await conn.execute("show timezone")
+            assert await cur.fetchone() == ("+03:00",)
+
+
 @pytest.mark.crdb_skip("backend pid")
 async def test_reset_badstate(dsn, caplog):
     caplog.set_level(logging.WARNING, logger="psycopg.pool")
@@ -1047,6 +1095,7 @@ async def test_cancelled_waiter_assigned_conn_is_reclaimed(dsn, monkeypatch):
             pytest.fail("cancelled waiter returned a connection instead of raising")
 
         await gather(putter)
+        await p.wait()
 
         stats = p.get_stats()
         assert stats["pool_available"] == 1

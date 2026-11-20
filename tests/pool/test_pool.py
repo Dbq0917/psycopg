@@ -230,6 +230,53 @@ def test_reset(dsn):
         assert resets == 2
 
 
+def test_reset_session_state(dsn):
+    with pool.ConnectionPool(dsn, min_size=1, max_size=1) as p:
+        with p.connection() as conn:
+            pid = conn.info.backend_pid
+            cur = conn.execute("show statement_timeout")
+            initial_timeout = cur.fetchone()
+            cur = conn.execute("show timezone")
+            initial_timezone = cur.fetchone()
+
+            conn.execute("set statement_timeout to '2s'")
+            conn.execute("set timezone to '+05:00'")
+            conn.commit()
+
+        p.wait()
+
+        with p.connection() as conn:
+            assert conn.info.backend_pid == pid
+            cur = conn.execute("show statement_timeout")
+            assert cur.fetchone() == initial_timeout
+            cur = conn.execute("show timezone")
+            assert cur.fetchone() == initial_timezone
+
+
+def test_reset_session_state_configure(dsn):
+
+    def configure(conn):
+        conn.execute("set statement_timeout to '3s'")
+        conn.execute("set timezone to '+03:00'")
+        conn.commit()
+
+    with pool.ConnectionPool(dsn, min_size=1, max_size=1, configure=configure) as p:
+        with p.connection() as conn:
+            pid = conn.info.backend_pid
+            conn.execute("set statement_timeout to '2s'")
+            conn.execute("set timezone to '+05:00'")
+            conn.commit()
+
+        p.wait()
+
+        with p.connection() as conn:
+            assert conn.info.backend_pid == pid
+            cur = conn.execute("show statement_timeout")
+            assert cur.fetchone() == ("3s",)
+            cur = conn.execute("show timezone")
+            assert cur.fetchone() == ("+03:00",)
+
+
 @pytest.mark.crdb_skip("backend pid")
 def test_reset_badstate(dsn, caplog):
     caplog.set_level(logging.WARNING, logger="psycopg.pool")

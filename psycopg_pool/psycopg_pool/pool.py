@@ -22,6 +22,7 @@ from collections.abc import Iterator
 
 from psycopg import Connection
 from psycopg import errors as e
+from psycopg import sql
 from psycopg.pq import TransactionStatus
 
 from .abc import CT, ConnectFailedCB, ConnectionCB, ConninfoParam, KwargsParam
@@ -641,6 +642,8 @@ class ConnectionPool(Generic[CT], BasePool):
                     f"connection left in status {sname} by configure function {self._configure}: discarded"
                 )
 
+        self._save_session_state(conn)
+
         # Set an expiry date, with some randomness to avoid mass reconnection
         self._set_connection_expiry_date(conn)
         return conn
@@ -816,6 +819,16 @@ class ConnectionPool(Generic[CT], BasePool):
             logger.warning("closing returned connection: %s", conn)
             self._close_connection(conn)
 
+        if conn.closed:
+            return
+
+        try:
+            self._reset_session_state(conn)
+        except CLIENT_EXCEPTIONS as ex:
+            logger.warning("error resetting connection session: %s", ex)
+            self._close_connection(conn)
+            return
+
         if self._reset:
             try:
                 self._reset(conn)
@@ -827,6 +840,63 @@ class ConnectionPool(Generic[CT], BasePool):
             except CLIENT_EXCEPTIONS as ex:
                 logger.warning("error resetting connection: %s", ex)
                 self._close_connection(conn)
+
+    def _save_session_state(self, conn: CT) -> None:
+        """
+        Save the session settings changed when the connection was configured.
+
+        RESET ALL restores the settings to the server defaults, including the
+        options used to establish the connection. Values changed by the
+        configure callback are not defaults, so save them here to restore them
+        when the connection is returned to the pool.
+        """
+        settings: dict[str, str] = {}
+        if self._configure:
+            autocommit = conn.autocommit
+            if not autocommit:
+                conn.autocommit = True
+            try:
+                cur = conn.execute(
+                    "SELECT name, setting FROM pg_settings WHERE source IN ('session', 'client') AND context IN ('user', 'superuser', 'backend', 'superuser-backend') AND setting IS DISTINCT FROM reset_val"
+                )
+                settings = {name: value for name, value in cur.fetchall()}
+            finally:
+                if not autocommit:
+                    conn.autocommit = False
+
+        setattr(conn, "_pool_session_state", settings)
+
+    def _reset_session_state(self, conn: CT) -> None:
+        """
+        Reset session settings to the values found when the connection was added.
+
+        The reset is performed in a single query, so that returning many
+        connections doesn't result in a query per setting.
+        """
+        settings = getattr(conn, "_pool_session_state", None)
+        if settings is None:
+            return
+
+        query: sql.SQL | sql.Composed = sql.SQL("RESET ALL")
+        if settings:
+            restore = sql.SQL(", ").join(
+                (
+                    sql.SQL("set_config({}, {}, false)").format(
+                        sql.Literal(name), sql.Literal(value)
+                    )
+                    for name, value in settings.items()
+                )
+            )
+            query = sql.SQL("{}; SELECT {}").format(query, restore)
+
+        autocommit = conn.autocommit
+        if not autocommit:
+            conn.autocommit = True
+        try:
+            conn.execute(query)
+        finally:
+            if not autocommit:
+                conn.autocommit = False
 
     def _close_connection(self, conn: CT) -> None:
         conn._pool = None

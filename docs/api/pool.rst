@@ -112,7 +112,10 @@ The `!ConnectionPool` class
                  the pool. The connection is guaranteed to be passed to the
                  `!reset()` function in "idle" state (no transaction). When
                  leaving the `!reset()` function the connection must be left in
-                 *idle* state, otherwise it is discarded.
+                 *idle* state, otherwise it is discarded. The pool resets the
+                 session settings to their initial values before calling this
+                 callback, which can therefore be used to apply
+                 application-specific settings.
    :type reset: `Callable[[Connection], None]`
 
    :param name: An optional name to give to the pool, useful, for instance, to
@@ -313,8 +316,10 @@ Only the functions and parameters with different signature from
    :param configure: A callback to configure a connection after creation.
    :type configure: `async Callable[[AsyncConnection], None]`
 
-   :param reset: A callback to reset a function after it has been returned to
-                 the pool.
+   :param reset: A callback to reset a connection after it has been returned to
+                 the pool. The pool resets the session settings to their
+                 initial values before calling this callback, which can
+                 therefore be used to apply application-specific settings.
    :type reset: `async Callable[[AsyncConnection], None]`
 
    :param reconnect_failed: Callback invoked if an attempt to create a new

@@ -13,6 +13,10 @@ Future releases
 psycopg_pool 3.3.4 (unreleased)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+- Reset session-level settings when a connection is returned to the pool, so
+  that changes such as ``statement_timeout`` or ``TimeZone`` are not inherited
+  by the next client. Settings applied by the ``configure`` callback are
+  restored. The reset is performed in a single query.
 - Invoke the `!reconnect_failed` callback in `NullConnectionPool`, where it was
   accepted but never called (:ticket:`#1424`).
 - Fix the count of the connections in `NullConnectionPool` becoming negative

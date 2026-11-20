@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager, suppress
 from collections import deque
 from collections.abc import AsyncIterator
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 from psycopg import errors as e
 from psycopg.pq import TransactionStatus
 
@@ -719,6 +719,8 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
                     f" {self._configure}: discarded"
                 )
 
+        await self._save_session_state(conn)
+
         # Set an expiry date, with some randomness to avoid mass reconnection
         self._set_connection_expiry_date(conn)
         return conn
@@ -899,6 +901,16 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
             logger.warning("closing returned connection: %s", conn)
             await self._close_connection(conn)
 
+        if conn.closed:
+            return
+
+        try:
+            await self._reset_session_state(conn)
+        except CLIENT_EXCEPTIONS as ex:
+            logger.warning("error resetting connection session: %s", ex)
+            await self._close_connection(conn)
+            return
+
         if self._reset:
             try:
                 await self._reset(conn)
@@ -911,6 +923,79 @@ class AsyncConnectionPool(Generic[ACT], BasePool):
             except CLIENT_EXCEPTIONS as ex:
                 logger.warning("error resetting connection: %s", ex)
                 await self._close_connection(conn)
+
+    async def _save_session_state(self, conn: ACT) -> None:
+        """
+        Save the session settings changed when the connection was configured.
+
+        RESET ALL restores the settings to the server defaults, including the
+        options used to establish the connection. Values changed by the
+        configure callback are not defaults, so save them here to restore them
+        when the connection is returned to the pool.
+        """
+        settings: dict[str, str] = {}
+        if self._configure:
+            autocommit = conn.autocommit
+            if True:  # ASYNC
+                if not autocommit:
+                    await conn.set_autocommit(True)
+            else:
+                if not autocommit:
+                    conn.autocommit = True
+            try:
+                cur = await conn.execute(
+                    "SELECT name, setting FROM pg_settings"
+                    " WHERE source IN ('session', 'client')"
+                    " AND context IN ('user', 'superuser', 'backend',"
+                    " 'superuser-backend')"
+                    " AND setting IS DISTINCT FROM reset_val"
+                )
+                settings = {name: value for name, value in await cur.fetchall()}
+            finally:
+                if not autocommit:
+                    if True:  # ASYNC
+                        await conn.set_autocommit(False)
+                    else:
+                        conn.autocommit = False
+
+        setattr(conn, "_pool_session_state", settings)
+
+    async def _reset_session_state(self, conn: ACT) -> None:
+        """
+        Reset session settings to the values found when the connection was added.
+
+        The reset is performed in a single query, so that returning many
+        connections doesn't result in a query per setting.
+        """
+        settings = getattr(conn, "_pool_session_state", None)
+        if settings is None:
+            return
+
+        query: sql.SQL | sql.Composed = sql.SQL("RESET ALL")
+        if settings:
+            restore = sql.SQL(", ").join(
+                sql.SQL("set_config({}, {}, false)").format(
+                    sql.Literal(name), sql.Literal(value)
+                )
+                for name, value in settings.items()
+            )
+            query = sql.SQL("{}; SELECT {}").format(query, restore)
+
+        autocommit = conn.autocommit
+        if True:  # ASYNC
+            if not autocommit:
+                await conn.set_autocommit(True)
+        else:
+            if not autocommit:
+                conn.autocommit = True
+        try:
+            await conn.execute(query)
+        finally:
+            if not autocommit:
+                if True:  # ASYNC
+                    await conn.set_autocommit(False)
+                else:
+                    conn.autocommit = False
 
     async def _close_connection(self, conn: ACT) -> None:
         conn._pool = None
